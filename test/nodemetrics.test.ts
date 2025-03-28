@@ -1,54 +1,56 @@
-const fs = require("fs");
-const spectator = require("nflx-spectator");
-const NodeMetrics = require("../");
-const assert = require("chai").assert;
+import fs from "node:fs";
+import {Config, MemoryWriter, parse_protocol_line, Registry} from "nflx-spectator";
+import {assert} from "chai";
+import {RuntimeMetrics} from "../src/index.js"
+import {describe, it} from "node:test";
 
-describe("nodemetrics", () => {
+describe("nodemetrics", (): void => {
 
-  it("should not prevent node from exiting", () => {
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve: (value: void | PromiseLike<void>) => void): void => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  it("should not prevent node from exiting", (): void => {
     // ensure `start()` with no `stop()` does not prevent mocha from exiting
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-    const metrics = new NodeMetrics(registry);
+    const r = new Registry(new Config("memory"));
+    const metrics = new RuntimeMetrics(r);
     metrics.start();
   });
 
-  it("should generate a few meters", (done) => {
+  it("should generate a few meters", async (): Promise<void> => {
     // ensure `start()` actually starts the collection
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-    const metrics = new NodeMetrics(registry);
+    const r = new Registry(new Config("memory"));
+    const writer = r.writer() as MemoryWriter;
+    const metrics = new RuntimeMetrics(r);
     metrics.start();
 
-    setTimeout(() => {
-      // locally, we can see 3-12 values, mostly 3
-      assert.isTrue(registry.writer().get().length >= 3);
-      metrics.stop();
-      done();
-    }, 2);
+    await sleep(5);  // tiny pause is necessary to see data
+
+    assert.isTrue(writer.get().length >= 3);
   });
 
-  it("should collect gc metrics", () => {
+  it("should collect gc metrics", (): void => {
     const gcEvents = JSON.parse(fs.readFileSync("test/resources/gc-events.json").toString());
+    const r = new Registry(new Config("memory"));
+    const writer = r.writer() as MemoryWriter;
 
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-
-    let nanos = 0;
-    const f = process.hrtime;
-    process.hrtime = () => {
+    let nanos: number = 0;
+    const f: NodeJS.HRTime = process.hrtime;
+    process.hrtime = (): [number, number] => {
       nanos += 1e6;
       return [0, nanos];
     };
 
-    const metrics = new NodeMetrics(registry);
+    const metrics = new RuntimeMetrics(r);
 
-    let mapSize;
-    let largeSize;
-    let expectedLiveDataSize;
+    let mapSize: number | undefined;
+    let largeSize: number | undefined;
+    let expectedLiveDataSize: number | undefined;
 
-    function callbackGenerator(fn) {
-      for (let gcEvent of gcEvents) {
+    function callbackGenerator(fn: any): void {
+      for (const gcEvent of gcEvents) {
         fn(gcEvent);
 
         const oldAfter = gcEvent.after.heapSpaceStats[2].spaceUsedSize;
@@ -75,8 +77,8 @@ describe("nodemetrics", () => {
         }
         largeSize = afterLarge;
 
-        for (let line of registry.writer().get()) {
-          const [, id, value] = spectator.parse_protocol_line(line);
+        for (const line of writer.get()) {
+          const [, id, value] = parse_protocol_line(line);
 
           assert.equal(id.tags()["nodejs.version"], process.version);
 
@@ -94,95 +96,92 @@ describe("nodemetrics", () => {
             assert.fail(`Unexpected protocol line: ${line}`);
           }
         }
-        registry.writer().clear();
+
+        writer.clear();
       }
     }
 
-    metrics._gcEvents(callbackGenerator);
+    metrics.measureGcEvents(callbackGenerator);
 
     process.hrtime = f;
   });
 
-  it("should collect fd metrics", () => {
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-    const metrics = new NodeMetrics(registry);
+  it("should collect fd metrics", (): void => {
+    const r = new Registry(new Config("memory"));
+    const writer = r.writer() as MemoryWriter;
+    const metrics = new RuntimeMetrics(r);
 
-    function assertFd(open, max) {
-      for (let line of registry.writer().get()) {
-        const [, id, value] = spectator.parse_protocol_line(line);
+    function assertFd(open: number, max?: number): void {
+      for (const line of writer.get()) {
+        const [, id, value] = parse_protocol_line(line);
         if (id.name() === "openFileDescriptorsCount") {
-          assert.equal(value, open, "openFileDescriptorsCount does not match");
+          assert.equal(parseFloat(value), open, "openFileDescriptorsCount does not match");
         } else if (id.name() === "maxFileDescriptorsCount") {
-          assert.equal(value, max, "maxFileDescriptorsCount does not match");
+          assert.equal(parseFloat(value), max, "maxFileDescriptorsCount does not match");
         } else {
           assert.fail(`Unexpected protocol line: ${line}`);
         }
       }
-      registry.writer().clear();
+      writer.clear();
     }
 
-    NodeMetrics.updateFdGauges(metrics, () => {
+    RuntimeMetrics.measureFdActivity(metrics, (): {used: number, max: number} => {
       return {used: 42, max: 32768};
     });
     assertFd(42, 32768);
 
-    NodeMetrics.updateFdGauges(metrics, () => {
+    RuntimeMetrics.measureFdActivity(metrics, (): {used: number, max: number} => {
       return {used: 1, max: 1024};
     });
     assertFd(1, 1024);
 
     // test max == null (which shouldn't produce a metric)
-    NodeMetrics.updateFdGauges(metrics, () => {
+    RuntimeMetrics.measureFdActivity(metrics, (): {used: number, max: null} => {
       return {used: 1, max: null};
     });
     assertFd(1);
   });
 
-  it("should collect event loop lag time", () => {
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-    const metrics = new NodeMetrics(registry);
+  it("should collect event loop lag time", (): void => {
+    const r = new Registry(new Config("memory"));
+    const writer = r.writer() as MemoryWriter;
+    const metrics = new RuntimeMetrics(r);
 
-    let nanos = 0;
-    let round = 1;
-    const f = process.hrtime;
-    process.hrtime = () => {
+    function assertLag(expected: number): void {
+      assert.equal(writer.get().length, 1);
+      const [, id, value] = parse_protocol_line(writer.get()[0]);
+      assert.equal(id.name(), "nodejs.eventLoopLag");
+      assert.equal(id.tags()["nodejs.version"], process.version);
+      assert.closeTo(parseFloat(value), expected, 1e-6);
+      writer.clear();
+    }
+
+    let nanos: number = 0;
+    let round: number = 1;
+    const f: NodeJS.HRTime = process.hrtime;
+    process.hrtime = (): [number, number] => {
       nanos += 1e9 + round * 1e6;  // 1ms lag first time, 2ms second time, etc.
       ++round;
       return [0, nanos];
     };
 
-    metrics._lastNanos = 0;
+    RuntimeMetrics.measureEventLoopLag(metrics);
+    assertLag(0.001);
 
-    NodeMetrics.updateEventLoopLag(metrics);
-    assert.equal(registry.writer().get().length, 1);
-    let [, id, value] = spectator.parse_protocol_line(registry.writer().get()[0]);
-    assert.equal(id.name(), "nodejs.eventLoopLag");
-    assert.equal(id.tags()["nodejs.version"], process.version);
-    assert.closeTo(parseFloat(value), 0.001, 1e-6);
-    registry.writer().clear();
+    RuntimeMetrics.measureEventLoopLag(metrics);
+    assertLag(0.002);
 
-    NodeMetrics.updateEventLoopLag(metrics);
-    assert.equal(registry.writer().get().length, 1);
-    [, , value] = spectator.parse_protocol_line(registry.writer().get()[0]);
-    assert.closeTo(parseFloat(value), 0.002, 1e-6);
-    registry.writer().clear();
-
-    NodeMetrics.updateEventLoopLag(metrics);
-    assert.equal(registry.writer().get().length, 1);
-    [, , value] = spectator.parse_protocol_line(registry.writer().get()[0]);
-    assert.closeTo(parseFloat(value), 0.003, 1e-6);
-    registry.writer().clear();
+    RuntimeMetrics.measureEventLoopLag(metrics);
+    assertLag(0.003);
 
     process.hrtime = f;
   });
 
-  it("should collect eventLoopUtilization metrics when possible", () => {
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
+  it("should collect eventLoopUtilization metrics when possible", (): void => {
+    const r = new Registry(new Config("memory"));
+    const writer = r.writer() as MemoryWriter;
+    const metrics = new RuntimeMetrics(r);
 
-    const metrics = new NodeMetrics(registry);
     metrics.lastEventLoopTime = [0, 0];
     metrics.lastEventLoop = {
       idle: 0,
@@ -200,19 +199,19 @@ describe("nodemetrics", () => {
       return Object.assign({}, elu);
     };
 
-    const f = process.hrtime;
-    let seconds = 3;
-    process.hrtime = () => {
+    const f: NodeJS.HRTime = process.hrtime;
+    let seconds: number = 3;
+    process.hrtime = (): [number, number] => {
       return [seconds, 0];
     };
 
-    NodeMetrics.measureEventLoopUtilization(metrics);
-    assert.equal(registry.writer().get().length, 1);
-    let [, id, value] = spectator.parse_protocol_line(registry.writer().get()[0]);
+    RuntimeMetrics.measureEventLoopUtilization(metrics);
+    assert.equal(writer.get().length, 1);
+    let [, id, value] = parse_protocol_line(writer.get()[0]);
     assert.equal(id.name(), "nodejs.eventLoopUtilization");
     assert.equal(id.tags()["nodejs.version"], process.version);
     assert.closeTo(parseFloat(value), 200 / 3.0, 1e-6);
-    registry.writer().clear();
+    writer.clear();
 
     // 5s, 1s active, 4s idle
     seconds += 5;
@@ -220,18 +219,17 @@ describe("nodemetrics", () => {
     elu.active += 1000;
     elu.utilization = 1 / 5.0;
 
-    NodeMetrics.measureEventLoopUtilization(metrics);
-    assert.equal(registry.writer().get().length, 1);
-    [, , value] = spectator.parse_protocol_line(registry.writer().get()[0]);
+    RuntimeMetrics.measureEventLoopUtilization(metrics);
+    assert.equal(writer.get().length, 1);
+    [, id, value] = parse_protocol_line(writer.get()[0]);
     assert.closeTo(parseFloat(value), 100 / 5.0, 1e-6);
 
     process.hrtime = f;
   });
 
-  it("should provide a way to check whether it has started", () => {
-    const config = new spectator.Config("memory");
-    const registry = new spectator.Registry(config);
-    const metrics = new NodeMetrics(registry);
+  it("should provide a way to check whether it has started", (): void => {
+    const r = new Registry(new Config("memory"));
+    const metrics = new RuntimeMetrics(r);
 
     assert.isFalse(metrics.started);
     metrics.start();
