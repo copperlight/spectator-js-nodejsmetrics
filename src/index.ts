@@ -4,6 +4,14 @@ import {Counter, Gauge, Registry, Tags, Timer} from "nflx-spectator";
 import {HeapInfo, HeapSpaceInfo} from "v8";
 import {EventLoopUtilityFunction, EventLoopUtilization, performance} from "perf_hooks";
 
+export interface IndexedHeapInfo extends HeapInfo {
+  [key: string]: number;
+};
+
+export interface IndexedHeapSpaceInfo extends HeapSpaceInfo {
+  [key: string]: number | string;
+};
+
 const internals = bindings({
   try: [
     ['module_root', '..', 'build', 'Release', 'spectator_internals.node'],
@@ -33,14 +41,14 @@ function toCamelCase(s: string): string {
   });
 }
 
-function updateV8HeapGauges(r: Registry, extraTags: Tags, heapInfo: HeapInfo): void {
+function updateV8HeapGauges(r: Registry, extraTags: Tags, heapInfo: IndexedHeapInfo): void {
   for (const key of Object.keys(heapInfo)) {
     const name: string = 'nodejs.' + toCamelCase(key);
     void r.gauge(name, extraTags).set(heapInfo[key]);
   }
 }
 
-function updateV8HeapSpaceGauges(r: Registry, extraTags: Tags, heapSpaceInfos: HeapSpaceInfo[]): void {
+function updateV8HeapSpaceGauges(r: Registry, extraTags: Tags, heapSpaceInfos: IndexedHeapSpaceInfo[]): void {
   for (const space of heapSpaceInfos) {
     const id: string = toCamelCase(space.space_name);
 
@@ -48,7 +56,7 @@ function updateV8HeapSpaceGauges(r: Registry, extraTags: Tags, heapSpaceInfos: H
       if (key !== 'space_name') {
         const name: string = 'nodejs.' + toCamelCase(key);
         const tags: Tags = Object.assign({'id': id}, extraTags);
-        void r.gauge(name, tags).set(space[key]);
+        void r.gauge(name, tags).set(space[key] as number);
       }
     }
   }
@@ -395,8 +403,8 @@ export class RuntimeMetrics {
     self.lastCpuUsageTime = newCpuUsageTime;
     self.lastCpuUsage = newCpuUsage;
 
-    updateV8HeapGauges(self.registry, self.withVersion(), v8.getHeapStatistics());
-    updateV8HeapSpaceGauges(self.registry, self.withVersion(), v8.getHeapSpaceStatistics());
+    updateV8HeapGauges(self.registry, self.withVersion(), v8.getHeapStatistics() as IndexedHeapInfo);
+    updateV8HeapSpaceGauges(self.registry, self.withVersion(), v8.getHeapSpaceStatistics() as IndexedHeapSpaceInfo[]);
   }
 
   private initCpuHeap(): void {
