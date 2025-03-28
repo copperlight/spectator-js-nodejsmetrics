@@ -38,10 +38,14 @@ describe("nodemetrics", (): void => {
 
     let nanos: number = 0;
     const f: NodeJS.HRTime = process.hrtime;
-    process.hrtime = (): [number, number] => {
-      nanos += 1e6;
-      return [0, nanos];
-    };
+    Object.defineProperty(process, 'hrtime', {
+      get(): () => [number, number] {
+        return (): [number, number] => {
+          nanos += 1e6;
+          return [0, nanos];
+        };
+      }
+    });
 
     const metrics = new RuntimeMetrics(r);
 
@@ -103,7 +107,7 @@ describe("nodemetrics", (): void => {
 
     metrics.measureGcEvents(callbackGenerator);
 
-    process.hrtime = f;
+    Object.defineProperty(process, 'hrtime', f);
   });
 
   it("should collect fd metrics", (): void => {
@@ -159,11 +163,15 @@ describe("nodemetrics", (): void => {
     let nanos: number = 0;
     let round: number = 1;
     const f: NodeJS.HRTime = process.hrtime;
-    process.hrtime = (): [number, number] => {
-      nanos += 1e9 + round * 1e6;  // 1ms lag first time, 2ms second time, etc.
-      ++round;
-      return [0, nanos];
-    };
+    Object.defineProperty(process, 'hrtime', {
+      get(): () => [number, number]{
+        return (): [number, number] => {
+          nanos += 1e9 + round * 1e6;  // 1ms lag first time, 2ms second time, etc.
+          ++round;
+          return [0, nanos];
+        };
+      }
+    });
 
     RuntimeMetrics.measureEventLoopLag(metrics);
     assertLag(0.001);
@@ -174,13 +182,22 @@ describe("nodemetrics", (): void => {
     RuntimeMetrics.measureEventLoopLag(metrics);
     assertLag(0.003);
 
-    process.hrtime = f;
+    Object.defineProperty(process, 'hrtime', f);
   });
 
   it("should collect eventLoopUtilization metrics when possible", (): void => {
     const r = new Registry(new Config("memory"));
     const writer = r.writer() as MemoryWriter;
     const metrics = new RuntimeMetrics(r);
+
+    function assertUtil(expected: number): void {
+      assert.equal(writer.get().length, 1);
+      const [, id, value] = parse_protocol_line(writer.get()[0]);
+      assert.equal(id.name(), "nodejs.eventLoopUtilization");
+      assert.equal(id.tags()["nodejs.version"], process.version);
+      assert.closeTo(parseFloat(value), expected, 1e-6);
+      writer.clear();
+    }
 
     metrics.lastEventLoopTime = [0, 0];
     metrics.lastEventLoop = {
@@ -201,17 +218,16 @@ describe("nodemetrics", (): void => {
 
     const f: NodeJS.HRTime = process.hrtime;
     let seconds: number = 3;
-    process.hrtime = (): [number, number] => {
-      return [seconds, 0];
-    };
+    Object.defineProperty(process, 'hrtime', {
+      get(): () => [number, number]{
+        return (): [number, number] => {
+          return [seconds, 0];
+        };
+      }
+    });
 
     RuntimeMetrics.measureEventLoopUtilization(metrics);
-    assert.equal(writer.get().length, 1);
-    let [, id, value] = parse_protocol_line(writer.get()[0]);
-    assert.equal(id.name(), "nodejs.eventLoopUtilization");
-    assert.equal(id.tags()["nodejs.version"], process.version);
-    assert.closeTo(parseFloat(value), 200 / 3.0, 1e-6);
-    writer.clear();
+    assertUtil(200 / 3.0);
 
     // 5s, 1s active, 4s idle
     seconds += 5;
@@ -220,11 +236,9 @@ describe("nodemetrics", (): void => {
     elu.utilization = 1 / 5.0;
 
     RuntimeMetrics.measureEventLoopUtilization(metrics);
-    assert.equal(writer.get().length, 1);
-    [, id, value] = parse_protocol_line(writer.get()[0]);
-    assert.closeTo(parseFloat(value), 100 / 5.0, 1e-6);
+    assertUtil(100 /5.0);
 
-    process.hrtime = f;
+    Object.defineProperty(process, 'hrtime', f);
   });
 
   it("should provide a way to check whether it has started", (): void => {
